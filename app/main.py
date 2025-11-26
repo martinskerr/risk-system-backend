@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
-from security import verificar_password, crear_token, decodificar_token
+from security import verificar_password, crear_token, decodificar_token, hash_password, verify_password
 import pyodbc
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,6 +71,22 @@ class RiesgoUpdate(BaseModel):
     impacto: int
     estado: str
     responsable_id: int
+
+# ========== AGREGAR ESTOS DOS NUEVOS MODELOS ==========
+class UsuarioCreate(BaseModel):
+    nombre: str
+    email: str
+    password: str
+    rol: str = "Usuario"
+    activo: bool = True
+
+class UsuarioUpdate(BaseModel):
+    nombre: str
+    email: str
+    rol: str
+    activo: bool
+
+
 
 # ==================== AUTH ENDPOINTS ====================
 
@@ -476,6 +492,8 @@ def crear_incidente(incidente: IncidenteCreate, token: str = Depends(oauth2_sche
 
 
 
+# ========== ENDPOINTS DE USUARIOS ==========
+
 @app.get("/usuarios")
 def get_usuarios(token: str = Depends(oauth2_scheme)):
     payload = decodificar_token(token)
@@ -487,10 +505,9 @@ def get_usuarios(token: str = Depends(oauth2_scheme)):
         conn = pyodbc.connect(CONN_STR)
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT UsuarioID, Nombre, Email, Activo
+            SELECT UsuarioID, Nombre, Email, Rol, Activo, FechaRegistro
             FROM Usuarios
-            WHERE Activo = 1
-            ORDER BY Nombre
+            ORDER BY FechaRegistro DESC
         """)
 
         rows = cursor.fetchall()
@@ -501,12 +518,15 @@ def get_usuarios(token: str = Depends(oauth2_scheme)):
                 "id": r[0],
                 "nombre": r[1],
                 "email": r[2],
-                "activo": r[3]
+                "rol": r[3],
+                "activo": r[4],
+                "fecha_registro": str(r[5]) if r[5] else None
             })
 
         return result
     
     except Exception as e:
+        print(f"ERROR GET USUARIOS: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     
     finally:
@@ -514,3 +534,172 @@ def get_usuarios(token: str = Depends(oauth2_scheme)):
             conn.close()
 
 
+@app.post("/usuarios")
+def crear_usuario(usuario: UsuarioCreate, token: str = Depends(oauth2_scheme)):
+    payload = decodificar_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    
+    # Solo admin puede crear usuarios
+    if payload.get('rol') != 'ADMIN':
+        raise HTTPException(status_code=403, detail="No tienes permisos para crear usuarios")
+    
+    conn = None
+    try:
+        conn = pyodbc.connect(CONN_STR)
+        cursor = conn.cursor()
+        
+        # Verificar si el email ya existe
+        cursor.execute("SELECT UsuarioID FROM Usuarios WHERE Email = ?", usuario.email)
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail="El email ya está registrado")
+        
+        # Hash de la contraseña
+        hashed_password = hash_password(usuario.password)
+        
+        cursor.execute("""
+            INSERT INTO Usuarios 
+            (Nombre, Email, Password, Rol, Activo, FechaRegistro)
+            VALUES (?, ?, ?, ?, ?, GETDATE())
+        """, 
+        usuario.nombre,
+        usuario.email,
+        hashed_password,
+        usuario.rol,
+        usuario.activo
+        )
+        
+        conn.commit()
+        
+        cursor.execute("SELECT @@IDENTITY AS id")
+        nuevo_id = cursor.fetchone()[0]
+        
+        return {
+            "mensaje": "Usuario creado exitosamente",
+            "usuario_id": int(nuevo_id)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR POST USUARIO: {e}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.put("/usuarios/{usuario_id}")
+def actualizar_usuario(usuario_id: int, usuario: UsuarioUpdate, token: str = Depends(oauth2_scheme)):
+    payload = decodificar_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    
+    # Solo admin puede editar usuarios
+    if payload.get('rol') != 'ADMIN':
+        raise HTTPException(status_code=403, detail="No tienes permisos para editar usuarios")
+    
+    conn = None
+    try:
+        conn = pyodbc.connect(CONN_STR)
+        cursor = conn.cursor()
+        
+        # Verificar que el usuario existe
+        cursor.execute("SELECT UsuarioID FROM Usuarios WHERE UsuarioID = ?", usuario_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        
+        # Verificar si el email ya existe en otro usuario
+        cursor.execute("SELECT UsuarioID FROM Usuarios WHERE Email = ? AND UsuarioID != ?", usuario.email, usuario_id)
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail="El email ya está en uso")
+        
+        cursor.execute("""
+            UPDATE Usuarios 
+            SET Nombre=?, Email=?, Rol=?, Activo=?
+            WHERE UsuarioID=?
+        """, 
+        usuario.nombre,
+        usuario.email,
+        usuario.rol,
+        usuario.activo,
+        usuario_id
+        )
+        
+        conn.commit()
+        
+        return {"mensaje": "Usuario actualizado exitosamente"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR PUT USUARIO: {e}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.delete("/usuarios/{usuario_id}")
+def eliminar_usuario(usuario_id: int, token: str = Depends(oauth2_scheme)):
+    payload = decodificar_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    
+    # Solo admin puede eliminar usuarios
+    if payload.get('rol') != 'ADMIN':
+        raise HTTPException(status_code=403, detail="No tienes permisos para eliminar usuarios")
+    
+    # No permitir eliminar al propio usuario
+    user_id_from_token = int(payload.get('sub', 0))
+    if user_id_from_token == usuario_id:
+        raise HTTPException(status_code=400, detail="No puedes eliminar tu propio usuario")
+    
+    conn = None
+    try:
+        conn = pyodbc.connect(CONN_STR)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT UsuarioID FROM Usuarios WHERE UsuarioID=?", usuario_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        
+        # En lugar de eliminar, mejor desactivar
+        cursor.execute("UPDATE Usuarios SET Activo=0 WHERE UsuarioID=?", usuario_id)
+        conn.commit()
+        
+        return {"mensaje": "Usuario desactivado exitosamente"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR DELETE USUARIO: {e}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if conn:
+            conn.close()
+            conn.close()
+
+
+# ========== MODELOS PARA USUARIOS ==========
+class UsuarioCreate(BaseModel):
+    nombre: str
+    email: str
+    password: str
+    rol: str = "Usuario"
+    activo: bool = True
+
+class UsuarioUpdate(BaseModel):
+    nombre: str
+    email: str
+    rol: str
+    activo: bool

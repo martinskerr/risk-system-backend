@@ -27,3 +27,16 @@ def decodificar_token(token: str):
         return payload
     except JWTError:
         return None
+
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    """Hashea una contraseña usando bcrypt"""
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifica que una contraseña coincida con su hash"""
+    return pwd_context.verify(plain_password, hashed_password)
+
