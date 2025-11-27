@@ -3,6 +3,9 @@ import requests
 from datetime import datetime
 import json
 
+#pytest --html=reporte_pruebas.html --self-contained-html -v
+
+
 BASE_URL = "http://127.0.0.1:8000"
 
 def obtener_token_analista() -> str:
